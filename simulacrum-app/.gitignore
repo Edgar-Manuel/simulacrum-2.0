@@ -1,0 +1,44 @@
+# See repository root .gitignore for the canonical rules.
+# This file mirrors a subset that applies specifically to the app folder.
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-ssr/
+*.local
+
+# Environment files (never commit)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Personal scripts / data
+sell_btc.cjs
+sell_btc.js
+sell_order.json
+buy_*.cjs
+buy_*.js
+*_order.json
+TRADING_REPORT_*.md

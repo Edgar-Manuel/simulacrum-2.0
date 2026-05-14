@@ -1,0 +1,148 @@
+# ============================================
+# DEPENDENCIES
+# ============================================
+node_modules/
+**/node_modules/
+jspm_packages/
+.pnp/
+.pnp.js
+.yarn/
+.pnpm-store/
+
+# ============================================
+# SECRETS & ENVIRONMENT (CRITICAL - never commit)
+# ============================================
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.envrc
+
+# Secret/credential files
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*secret*
+*.secret
+*_secret.*
+secrets.json
+credentials.json
+service-account*.json
+keystore.json
+wallet.json
+*.keystore
+*mnemonic*
+*private_key*
+
+# ============================================
+# BUILD ARTIFACTS (often contain inlined secrets)
+# ============================================
+dist/
+**/dist/
+build/
+**/build/
+out/
+.next/
+.nuxt/
+.cache/
+.parcel-cache/
+.turbo/
+.vite/
+*.tsbuildinfo
+
+# ============================================
+# LOGS
+# ============================================
+logs/
+**/logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ============================================
+# IDE / EDITOR
+# ============================================
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.history/
+*.code-workspace
+
+# AI assistant rules (local to dev environment)
+.claude/
+.cursor/
+.clinerules/
+.kilocode/
+.roo/
+.windsurf/
+.kiro/
+.qoder/
+.augment/
+
+# ============================================
+# OS
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+nul
+
+# ============================================
+# COVERAGE / TEST OUTPUT
+# ============================================
+coverage/
+*.lcov
+.nyc_output/
+.jest-cache/
+
+# ============================================
+# PERSONAL SCRIPTS / DATA (one-off, not for public)
+# ============================================
+sell_btc.cjs
+sell_btc.js
+sell_order.json
+buy_*.cjs
+buy_*.js
+*_order.json
+TRADING_REPORT_*.md
+
+# Personal copyrighted content (video transcripts)
+Docs/transcripts/
+Docs/videos_list.json
+Docs/prompt-ingeniere.txt
+Docs/REPOSITORIOS_GITHUB_MANUAGI_COMPLETO.md
+scripts/extract_transcripts.py
+
+# ============================================
+# MISC
+# ============================================
+*.bak
+*.swp
+*.tmp
+*.temp
+.eslintcache
+.stylelintcache
+*.local
