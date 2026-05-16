@@ -146,3 +146,9 @@ scripts/extract_transcripts.py
 .eslintcache
 .stylelintcache
 *.local
+
+# ============================================
+# BACKTEST ARTIFACTS
+# ============================================
+backtest_*.json
+backtest_*.log
