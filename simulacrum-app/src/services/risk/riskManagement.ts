@@ -3,6 +3,8 @@
 // Controls position sizing, stop-loss, and risk parameters
 // ============================================
 
+import { riskService } from '../trading/riskService';
+
 export interface RiskConfig {
     // Position Sizing
     maxPositionSizePercent: number;     // Max % of portfolio per trade (default: 2%)
@@ -256,9 +258,11 @@ class RiskManagementService {
             timestamp: Date.now()
         });
 
-        // Limpiar trades antiguos (más de 2 horas)
-        const twoHoursAgo = Date.now() - (2 * 60 * 60 * 1000);
-        this.recentTrades = this.recentTrades.filter(t => t.timestamp > twoHoursAgo);
+        // Limpiar trades más viejos que el cooldown configurado. Antes se
+        // limpiaba a las 2h pero el cooldown era 30 min, lo que mantenía el
+        // bloqueo "similar trade" 90 min de más.
+        const cutoff = Date.now() - this.TRADE_COOLDOWN_MS;
+        this.recentTrades = this.recentTrades.filter(t => t.timestamp > cutoff);
 
         console.log(`📈 Position opened: ${symbol} ${side.toUpperCase()} ${size} @ ${entryPrice} [ID: ${orderId}]`);
     }
@@ -267,10 +271,20 @@ class RiskManagementService {
         const position = this.openPositions.get(symbol);
         if (!position) return 0;
 
-        const pnl = (exitPrice - position.entryPrice) * position.size;
+        // Respect side: shorts profit when exit < entry.
+        const direction = position.side === 'sell' ? -1 : 1;
+        const pnl = direction * (exitPrice - position.entryPrice) * position.size;
         this.dailyPnL += pnl;
         this.tradeHistory.push({ timestamp: Date.now(), pnl });
         this.openPositions.delete(symbol);
+
+        // Notify the trading risk service so its cooldown-after-loss /
+        // daily-loss circuit-breaker actually fires.
+        try {
+            riskService.recordTrade(pnl);
+        } catch {
+            // best-effort — don't fail the close
+        }
 
         console.log(`📉 Position closed: ${symbol} PnL: $${pnl.toFixed(2)}`);
         return pnl;
@@ -281,7 +295,10 @@ class RiskManagementService {
         entryPrice: number;
         stopLoss: number;
         takeProfit: number;
+        side: 'buy' | 'sell';
         orderId?: string;
+        stopLossOrderId?: string;
+        takeProfitOrderId?: string;
     }> {
         return new Map(this.openPositions);
     }
@@ -358,8 +375,11 @@ class RiskManagementService {
             };
         }
 
-        // 4️⃣ Check for similar trades (same direction, price within threshold)
+        // 4️⃣ Check for similar trades (same SYMBOL, same direction, price within threshold).
+        // Previously this missed the symbol check, so e.g. an ETH buy at 3000
+        // would block a BTC buy at 3001 because the price was within 3%.
         const similarTrade = this.recentTrades.find(trade => {
+            if (trade.symbol !== symbol) return false;
             if (trade.side !== side) return false;
             const priceDiff = Math.abs((entryPrice - trade.entryPrice) / trade.entryPrice) * 100;
             return priceDiff < this.SIMILAR_TRADE_THRESHOLD_PERCENT;

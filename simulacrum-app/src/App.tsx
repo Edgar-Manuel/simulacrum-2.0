@@ -944,6 +944,11 @@ const RiskMeter = ({ risk }: { risk: RiskAssessment | null }) => {
 
 // --- MAIN COMPONENT ---
 const SimulacrumTradingContent = () => {
+  // VITE_PAPER_TRADING_MODE is the master switch: when 'true' (the default),
+  // the UI cannot enable live trading. Flip to 'false' explicitly in .env
+  // once risk controls have been audited.
+  const paperOnlyMode = String(import.meta.env.VITE_PAPER_TRADING_MODE ?? 'true').toLowerCase() !== 'false';
+
   // State
   const [isRunning, setIsRunning] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false);
@@ -1128,7 +1133,7 @@ const SimulacrumTradingContent = () => {
                     .filter((o: any) => o.side === 'buy' && o.status === 'closed')
                     .sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0));
                   console.log(`📜 Found ${buyOrders.length} closed BUY orders, latest:`, buyOrders[0]);
-                  const lastBuyOrder = buyOrders[0];
+                  const lastBuyOrder = buyOrders[0] as (typeof buyOrders[number] & { average?: number });
                   if (lastBuyOrder) {
                     const price = lastBuyOrder.price || lastBuyOrder.average || 0;
                     if (price > 0) {
@@ -1144,49 +1149,47 @@ const SimulacrumTradingContent = () => {
               }
             }
 
-            const uiPositions: UIPosition[] = cryptoPositions.map((p: any) => {
-              const symbol = p.symbol || `${p.asset}/EUR`;
+            const uiPositions: UIPosition[] = cryptoPositions
+              .map((p: any) => {
+                const symbol = p.symbol || `${p.asset}/EUR`;
 
-              // 🔧 FIX: Get REAL entry price from multiple sources
-              const existingPosition = riskManagement.getOpenPositions().get(symbol);
-              let realEntryPrice: number;
+                // Only consider positions where we KNOW the entry price.
+                // Previously we fell back to currentPrice, which made SL/TP
+                // shift on every refresh and never trigger.
+                const existingPosition = riskManagement.getOpenPositions().get(symbol);
+                const knownEntry = existingPosition?.entryPrice && existingPosition.entryPrice > 0
+                  ? existingPosition.entryPrice
+                  : orderHistories[symbol];
 
-              if (existingPosition && existingPosition.entryPrice > 0) {
-                // 1. Best: Use the real entry price we recorded when the trade was executed
-                realEntryPrice = existingPosition.entryPrice;
-              } else if (orderHistories[symbol]) {
-                // 2. Good: Use the price from Binance order history
-                realEntryPrice = orderHistories[symbol];
-              } else {
-                // 3. Fallback: Use current price (0% PnL until we get real price)
-                realEntryPrice = p.currentPrice;
-              }
+                if (!knownEntry || knownEntry <= 0) {
+                  console.warn(`⚠️ Skipping ${symbol} sync: no verifiable entry price`);
+                  return null;
+                }
 
-              const pnl = (p.currentPrice - realEntryPrice) * p.size;
-              const pnlPercent = realEntryPrice > 0 ? ((p.currentPrice - realEntryPrice) / realEntryPrice) * 100 : 0;
+                const pnl = (p.currentPrice - knownEntry) * p.size;
+                const pnlPercent = ((p.currentPrice - knownEntry) / knownEntry) * 100;
 
-              // 🆕 SYNC TO RISK MANAGEMENT - Register position for anti-duplicate protection
-              if (!riskManagement.getOpenPositions().has(symbol)) {
-                riskManagement.openPosition(
+                // Register only the first time and only with a verified price.
+                if (!riskManagement.getOpenPositions().has(symbol)) {
+                  riskManagement.openPosition(symbol, p.size, knownEntry, 'buy');
+                  console.log(`🔄 Synced Binance position: ${symbol} @ €${knownEntry.toFixed(2)}`);
+                }
+
+                // SL/TP derived from the verified entry. These are still
+                // local-only markers; the source of truth is whatever live
+                // OCO/STOP_LOSS orders exist on Binance.
+                return {
                   symbol,
-                  p.size,
-                  realEntryPrice,
-                  'buy' // Assume long position
-                );
-                console.log(`🔄 Synced Binance position to riskManagement: ${symbol} @ €${realEntryPrice.toFixed(2)}`);
-              }
-
-              return {
-                symbol,
-                size: p.size,
-                entryPrice: realEntryPrice,
-                currentPrice: p.currentPrice,
-                stopLoss: realEntryPrice * 0.98, // 2% below REAL entry
-                takeProfit: realEntryPrice * 1.04, // 4% above REAL entry
-                pnl,
-                pnlPercent,
-              };
-            });
+                  size: p.size,
+                  entryPrice: knownEntry,
+                  currentPrice: p.currentPrice,
+                  stopLoss: knownEntry * 0.98,
+                  takeProfit: knownEntry * 1.04,
+                  pnl,
+                  pnlPercent,
+                };
+              })
+              .filter((p: UIPosition | null): p is UIPosition => p !== null);
 
             setOpenPositionsUI(uiPositions);
             console.log(`📊 Synced ${uiPositions.length} positions from Binance:`,
@@ -1235,6 +1238,10 @@ const SimulacrumTradingContent = () => {
     setMessages(prev => [...prev.slice(-50), message]);
   }, []);
 
+  // Shared close-in-flight guard used by both the manual close button and the
+  // automatic SL/TP monitor. Prevents double-close races.
+  const closingInFlight = useRef<Set<string>>(new Set());
+
   // 🔴 CLOSE POSITION MANUALLY - Allow user to close position before SL/TP
   const closePositionManually = useCallback(async (symbol: string) => {
     try {
@@ -1246,13 +1253,21 @@ const SimulacrumTradingContent = () => {
         setClosingPosition(null);
         return;
       }
+      // Cooperate with the auto-monitor so we don't double-close.
+      if (closingInFlight.current.has(symbol)) {
+        console.warn('Close already in flight for', symbol);
+        setClosingPosition(null);
+        return;
+      }
+      closingInFlight.current.add(symbol);
 
       console.log(`🔴 MANUALLY CLOSING POSITION: ${symbol}`, position);
 
-      // Place a market SELL order to close the position
+      // Close in the opposite direction of the open position.
+      const closeSide: 'buy' | 'sell' = position.side === 'buy' ? 'sell' : 'buy';
       const result = await binanceService.placeOrder({
         symbol,
-        side: 'sell',
+        side: closeSide,
         type: 'market',
         amount: position.size,
       });
@@ -1302,6 +1317,7 @@ const SimulacrumTradingContent = () => {
       });
     } finally {
       setClosingPosition(null);
+      closingInFlight.current.delete(symbol);
     }
   }, [addMessage]);
 
@@ -1380,50 +1396,10 @@ const SimulacrumTradingContent = () => {
 
         console.log(`✅ Trade aprobado: ${tradeValidation.reason}`);
 
-        // 🧠 VALIDACIÓN DEL RAZONAMIENTO DE LA IA (MENOS AGRESIVA)
-        // Solo bloquear si la IA EXPLÍCITAMENTE dice que NO opere
-        // No bloquear por mencionar riesgos, que es normal en cualquier análisis
-        const strictNegativePatterns = [
-          'la decisión final es hold',
-          'recomendación final es hold',
-          'recomiendo hold',
-          'no abrir posición',
-          'no ejecutar esta operación',
-          'cancelar la operación',
-          'veto la operación'
-        ];
-
-        const reasoningLower = action.reasoning.toLowerCase();
-
-        // Solo bloquear si encuentra patrones MUY específicos de rechazo
-        const aiRecommendsNoTrade = strictNegativePatterns.some(pattern =>
-          reasoningLower.includes(pattern)
-        );
-
-        if (aiRecommendsNoTrade) {
-          addMessage('guardian', 'ALL', 'AI_RECOMMENDATION_BLOCKED', {
-            message: `🧠 IA recomienda NO OPERAR - Respetando decisión`,
-            reasoning: action.reasoning.slice(0, 200) + '...',
-          });
-
-          // Register in Artifact Vault
-          setArtifacts(prev => [...prev, {
-            id: `ai_blocked_${Date.now()}`,
-            name: `🧠 IA_RECOMIENDA_NO_${action.type}_${action.symbol.replace('/', '_')}`,
-            type: 'SIGNAL',
-            status: 'READY',
-            value: `IA recomienda mantener/esperar`,
-            content: JSON.stringify({
-              ...action,
-              blockedAt: new Date().toISOString(),
-              blockReason: 'La IA recomienda NO abrir esta posición en su razonamiento',
-              mode: 'AI_RECOMMENDED_HOLD',
-            }, null, 2),
-          }]);
-
-          setAgents(aiAgentsService.getAllAgents());
-          return;
-        }
+        // Note: the previous "search Spanish blacklist in reasoning" filter
+        // was removed. The caller now decides BUY/SELL/HOLD with the
+        // structured oracleAction / riskApproved fields, so reaching this
+        // function already implies a positive structured decision.
 
         // ⚠️ RISK VALIDATION - Always validate before executing
         const riskCheck = riskManagement.shouldExecuteTrade(
@@ -1458,8 +1434,18 @@ const SimulacrumTradingContent = () => {
           return;
         }
 
-        // Calculate safe position size using REAL EUR balance from Binance
-        const portfolioValue = binanceBalance ? parseFloat(binanceBalance) : 91.62; // 🔧 FIX: Use binanceBalance state
+        // Calculate safe position size using REAL EUR balance from Binance.
+        // Refuse to trade if we don't yet have a balance — sizing on a guess
+        // produced phantom orders sized against ~91€ even when the real
+        // account was empty or unavailable.
+        const parsedBalance = binanceBalance ? parseFloat(binanceBalance) : NaN;
+        if (!Number.isFinite(parsedBalance) || parsedBalance <= 0) {
+          addMessage('guardian', 'ALL', 'RISK_ALERT', {
+            message: '⛔ Sin balance disponible aún — abortando trade',
+          });
+          return;
+        }
+        const portfolioValue = parsedBalance;
         console.log('💰 Auto-trade using portfolio value:', portfolioValue, 'EUR');
 
         const positionCalc = riskManagement.calculatePositionSize(
@@ -1503,11 +1489,12 @@ const SimulacrumTradingContent = () => {
 
         if (result.success && result.order) {
           orderResult = result.order;
-          // Calculate actual profit from the trade
-          const tradeCost = result.order.filled * (result.order.price || action.price);
-          executionProfit = action.type === 'SELL' ? tradeCost : -tradeCost;
 
-          // 📊 TRACK POSITION - Registrar la posición abierta en risk management
+          // PnL is ZERO at order placement. It is realized only when the
+          // position is CLOSED. The previous code marked notional-as-PnL on
+          // open, which painted phantom profits/losses.
+          executionProfit = 0;
+
           if (action.type === 'BUY') {
             riskManagement.openPosition(
               action.symbol,
@@ -1515,21 +1502,14 @@ const SimulacrumTradingContent = () => {
               result.order.price || action.price,
               'buy'
             );
-            console.log('📊 Position tracked:', action.symbol, result.order.filled, 'BTC');
+            console.log('📊 Position opened:', action.symbol, result.order.filled);
           } else if (action.type === 'SELL') {
-            // Si es SELL, intentamos cerrar la posición existente
             const closedPnL = riskManagement.closePosition(action.symbol, result.order.price || action.price);
-
-            // Si no había posición registrada, calculamos el profit de la venta directamente
-            // (vendimos X BTC por Y USDT, el profit es el valor en USDT recibido)
-            if (closedPnL === 0) {
-              // Para una venta, el "profit" inmediato es lo que recibimos
-              // Esto se ajustará cuando cerremos la operación completa
-              executionProfit = result.order.filled * result.order.price; // USDT recibidos
-              console.log('📊 Direct SELL executed:', action.symbol, 'Received:', executionProfit.toFixed(2), 'USDT');
-            } else {
+            if (closedPnL !== 0) {
               executionProfit = closedPnL;
               console.log('📊 Position closed:', action.symbol, 'PnL:', closedPnL);
+            } else {
+              console.log('📊 Direct SELL executed (no tracked position to close)');
             }
           }
 
@@ -1544,12 +1524,18 @@ const SimulacrumTradingContent = () => {
           throw new Error(result.error || 'Order execution failed');
         }
       } else {
-        // Paper trading - simulate profit
-        executionProfit = (Math.random() - 0.3) * 100;
+        // Paper trading: open/close are PnL-neutral on execution. Realized
+        // PnL accrues only on close, via the same close path used in live.
+        executionProfit = 0;
+        if (action.type === 'BUY') {
+          riskManagement.openPosition(action.symbol, action.amount, action.price, 'buy');
+        } else if (action.type === 'SELL') {
+          executionProfit = riskManagement.closePosition(action.symbol, action.price);
+        }
         addMessage('claude_x', 'ALL', 'PAPER_EXECUTION', {
           action: action.type,
           symbol: action.symbol,
-          simulatedProfit: executionProfit.toFixed(2),
+          realizedPnl: executionProfit.toFixed(2),
         });
       }
 
@@ -1617,6 +1603,7 @@ const SimulacrumTradingContent = () => {
   // ============================================
   // POSITION MONITOR - Verifica SL/TP y cierra automáticamente
   // ============================================
+  // (closingInFlight declared earlier near closePositionManually.)
   const monitorOpenPositions = useCallback(async () => {
     if (!isLiveMode) return;
 
@@ -1634,35 +1621,47 @@ const SimulacrumTradingContent = () => {
         }
 
         const currentPrice = ticker.price;
-        const { entryPrice, stopLoss, takeProfit, size } = position;
+        const { entryPrice, stopLoss, takeProfit, size, side } = position;
 
         // Skip BNB - it's for transaction fees, not trading
         if (symbol.startsWith('BNB')) {
           continue;
         }
+        if (closingInFlight.current.has(symbol)) continue;
 
-        console.log(`📊 Monitoring ${symbol} - Current: €${currentPrice.toFixed(2)} | SL: €${stopLoss.toFixed(2)} | TP: €${takeProfit.toFixed(2)}`);
+        console.log(`📊 Monitoring ${symbol} (${side}) - Current: €${currentPrice.toFixed(2)} | SL: €${stopLoss.toFixed(2)} | TP: €${takeProfit.toFixed(2)}`);
 
         let shouldClose = false;
         let closeReason = '';
         let closeType: 'STOP_LOSS' | 'TAKE_PROFIT' | null = null;
 
-        // ⛔ CHECK STOP-LOSS
-        if (currentPrice <= stopLoss) {
-          shouldClose = true;
-          closeReason = `⛔ STOP-LOSS alcanzado: €${currentPrice.toFixed(2)} <= €${stopLoss.toFixed(2)}`;
-          closeType = 'STOP_LOSS';
-        }
-
-        // 🎯 CHECK TAKE-PROFIT
-        if (currentPrice >= takeProfit) {
-          shouldClose = true;
-          closeReason = `🎯 TAKE-PROFIT alcanzado: €${currentPrice.toFixed(2)} >= €${takeProfit.toFixed(2)}`;
-          closeType = 'TAKE_PROFIT';
+        // Long positions: stop is BELOW entry, target is ABOVE.
+        // Short positions: stop is ABOVE entry, target is BELOW.
+        if (side === 'buy') {
+          if (currentPrice <= stopLoss) {
+            shouldClose = true;
+            closeType = 'STOP_LOSS';
+            closeReason = `⛔ STOP-LOSS alcanzado: €${currentPrice.toFixed(2)} <= €${stopLoss.toFixed(2)}`;
+          } else if (currentPrice >= takeProfit) {
+            shouldClose = true;
+            closeType = 'TAKE_PROFIT';
+            closeReason = `🎯 TAKE-PROFIT alcanzado: €${currentPrice.toFixed(2)} >= €${takeProfit.toFixed(2)}`;
+          }
+        } else {
+          if (currentPrice >= stopLoss) {
+            shouldClose = true;
+            closeType = 'STOP_LOSS';
+            closeReason = `⛔ STOP-LOSS alcanzado (short): €${currentPrice.toFixed(2)} >= €${stopLoss.toFixed(2)}`;
+          } else if (currentPrice <= takeProfit) {
+            shouldClose = true;
+            closeType = 'TAKE_PROFIT';
+            closeReason = `🎯 TAKE-PROFIT alcanzado (short): €${currentPrice.toFixed(2)} <= €${takeProfit.toFixed(2)}`;
+          }
         }
 
         if (shouldClose && closeType) {
           console.log(`🔔 ${closeReason}`);
+          closingInFlight.current.add(symbol);
 
           addMessage('guardian', 'ALL', 'AUTO_CLOSE_TRIGGERED', {
             symbol,
@@ -1673,21 +1672,19 @@ const SimulacrumTradingContent = () => {
           });
 
           try {
-            // Ejecutar orden de venta para cerrar posición
+            // Close direction is the opposite of the position direction.
+            const closeSide: 'buy' | 'sell' = side === 'buy' ? 'sell' : 'buy';
             const result = await binanceService.placeOrder({
-              symbol: symbol,
-              side: 'sell',
+              symbol,
+              side: closeSide,
               type: 'market',
               amount: size,
             });
 
             if (result.success && result.order) {
               const order = result.order;
-              // Calcular P/L
-              const pnl = (order.price - entryPrice) * size;
-
-              // Cerrar posición en el tracker
-              riskManagement.closePosition(symbol, order.price);
+              // Use riskManagement to get a side-aware PnL.
+              const pnl = riskManagement.closePosition(symbol, order.price);
 
               // Actualizar stats
               setTradeCount(prev => prev + 1);
@@ -1733,6 +1730,8 @@ const SimulacrumTradingContent = () => {
               message: `Error cerrando posición ${symbol}`,
               error: String(closeError),
             });
+          } finally {
+            closingInFlight.current.delete(symbol);
           }
         }
       }
@@ -1835,35 +1834,42 @@ const SimulacrumTradingContent = () => {
       // Los agentes son suficientemente inteligentes para decidir
       console.log('🔍 AI Result:', { confidence: aiResult.confidence, signals: analysis.signals.length });
 
-      // 🛡️ RESPETAR EL ANÁLISIS DE RIESGO:
-      const reasoningLower = aiResult.reasoning.toLowerCase();
-      const riskRejected = reasoningLower.includes('rejected') ||
-        reasoningLower.includes('no aprobada') ||
-        reasoningLower.includes('rechazado') ||
-        reasoningLower.includes('veto');
+      // 🛡️ Trust the structured decision from the oracle/guardian over the
+      // brittle "search keywords in reasoning" approach we used before.
+      const oracleAction = aiResult.action;       // 'BUY' | 'SELL' | 'HOLD'
+      const riskApproved = aiResult.riskApproved;
 
-      // 📊 Calcular confianza efectiva: combinar IA + señales técnicas
+      // Top technical signal (if any) — only relevant when it agrees with the
+      // oracle. We never bypass an oracle HOLD with a technical signal.
       const topSignal = analysis.signals.length > 0
         ? analysis.signals.sort((a, b) => b.confidence - a.confidence)[0]
         : null;
       const technicalConfidence = topSignal?.confidence || 0;
-
-      // Si hay señal técnica fuerte (>=75%) y IA no rechaza explícitamente, usar la técnica
-      // Si IA tiene confianza alta, usar la de IA
-      const effectiveConfidence = Math.max(
-        aiResult.confidence,
-        riskRejected ? 0 : technicalConfidence * 0.9  // Dar 90% peso a técnica si IA no rechaza
+      const technicalAgrees = !!topSignal && (
+        (oracleAction === 'BUY' && topSignal.type === 'buy') ||
+        (oracleAction === 'SELL' && topSignal.type === 'sell')
       );
 
-      console.log(`📊 Confidence: AI=${aiResult.confidence}%, Technical=${technicalConfidence}%, Effective=${effectiveConfidence.toFixed(0)}%`);
+      // Effective confidence: the oracle's confidence, optionally boosted up
+      // to 90% of the technical confidence WHEN both agree on the direction.
+      const effectiveConfidence = technicalAgrees
+        ? Math.max(aiResult.confidence, Math.round(technicalConfidence * 0.9))
+        : aiResult.confidence;
 
-      if (riskRejected) {
-        console.log('⛔ Trade bloqueado - Análisis IA rechazó explícitamente');
+      console.log(`📊 Decision: oracle=${oracleAction}@${aiResult.confidence}%, technical=${topSignal?.type}@${technicalConfidence}%, risk=${riskApproved ? 'OK' : 'BLOCKED'}, effective=${effectiveConfidence}%`);
+
+      if (!riskApproved) {
+        console.log('⛔ Trade bloqueado por Guardian (gestión de riesgo)');
         addMessage('guardian', 'ALL', 'RISK_ALERT', {
           message: '⛔ Operación bloqueada por gestión de riesgo',
-          reason: 'El análisis indica que el riesgo no es aceptable en este momento'
+          reason: 'Guardian no aprobó esta operación',
         });
-      } else if (effectiveConfidence >= riskConfig.minConfidenceThreshold && topSignal && topSignal.type !== 'hold') {
+      } else if (oracleAction === 'HOLD') {
+        console.log('⏸️ Oracle decidió HOLD - no se ejecuta trade');
+        addMessage('fingpt_core', 'ALL', 'MARKET_UPDATE', {
+          message: `Oracle decidió HOLD (${aiResult.confidence}% conf)`,
+        });
+      } else if (effectiveConfidence >= riskConfig.minConfidenceThreshold && topSignal && topSignal.type !== 'hold' && technicalAgrees) {
         console.log(`✅ Confianza efectiva ${effectiveConfidence.toFixed(0)}% >= ${riskConfig.minConfidenceThreshold}% - Ejecutando trade`);
 
         const action: TradingAction = {
@@ -1894,10 +1900,12 @@ const SimulacrumTradingContent = () => {
         // Execute trade automatically instead of waiting for human approval
         executeAutomaticTrade(action);
       } else if (effectiveConfidence < riskConfig.minConfidenceThreshold) {
-        console.log(`⏸️ Confianza insuficiente (${effectiveConfidence.toFixed(0)}% < ${riskConfig.minConfidenceThreshold}%) - No se ejecuta trade`);
+        console.log(`⏸️ Confianza insuficiente (${effectiveConfidence}% < ${riskConfig.minConfidenceThreshold}%) - No se ejecuta trade`);
         addMessage('nexus_prime', 'ALL', 'MARKET_UPDATE', {
-          message: `Confianza insuficiente (${effectiveConfidence.toFixed(0)}%) - Manteniendo posición`
+          message: `Confianza insuficiente (${effectiveConfidence}%) - Manteniendo posición`,
         });
+      } else {
+        console.log('⏸️ Señal técnica no concuerda con oracle - no se ejecuta trade');
       }
 
       // Reset agent statuses
@@ -1911,12 +1919,25 @@ const SimulacrumTradingContent = () => {
     }
   }, [isRunning, selectedSymbol, fetchMarketData, addMessage, balance, realizedProfit]);
 
-  // Run analysis cycle periodically
+  // Run analysis cycle periodically. The cycle itself can take ~3 minutes
+  // (4 LLM hops with 45s delays), so we gate the timer so a slow cycle
+  // doesn't queue up overlapping passes.
+  const cycleInProgress = useRef(false);
   useEffect(() => {
     if (!isRunning) return;
 
-    runAnalysisCycle();
-    const interval = setInterval(runAnalysisCycle, 180000); // 🔥 Every 3 MINUTES (180 segundos) - permite que ciclos completos terminen
+    const guardedRun = async () => {
+      if (cycleInProgress.current) {
+        console.log('⏭️ Skipping cycle tick — previous cycle still running');
+        return;
+      }
+      cycleInProgress.current = true;
+      try { await runAnalysisCycle(); }
+      finally { cycleInProgress.current = false; }
+    };
+
+    guardedRun();
+    const interval = setInterval(guardedRun, 180000);
 
     return () => clearInterval(interval);
   }, [isRunning, runAnalysisCycle]);
@@ -1969,22 +1990,28 @@ const SimulacrumTradingContent = () => {
           return;
         }
 
-        // Calculate safe position size (max 10% of portfolio for small accounts)
-        // 🔧 FIX: Use binanceBalance state (the EUR balance from Binance)
-        let portfolioValue = binanceBalance ? parseFloat(binanceBalance) : 91.62;
+        // Calculate safe position size against the REAL EUR balance. Refuse
+        // to size against a guess (the old fallback of 91.62€ was the dev's
+        // own balance baked into source).
+        let portfolioValue = binanceBalance ? parseFloat(binanceBalance) : NaN;
 
         if (isLiveMode) {
           try {
             const realPortfolio = await binanceService.getPortfolio();
-            // Use EUR value from backend
-            if (realPortfolio && ((realPortfolio as any).totalValueEUR || realPortfolio.totalValueUSD) > 0) {
-              portfolioValue = (realPortfolio as any).totalValueEUR || realPortfolio.totalValueUSD || portfolioValue;
+            const valueFromPortfolio = (realPortfolio as any)?.totalValueEUR || realPortfolio?.totalValueUSD || 0;
+            if (valueFromPortfolio > 0) {
+              portfolioValue = valueFromPortfolio;
               console.log('💰 Using REAL portfolio value:', portfolioValue, 'EUR');
             }
           } catch (e) {
-            console.error('Failed to fetch portfolio, using binanceBalance:', binanceBalance);
-            portfolioValue = binanceBalance ? parseFloat(binanceBalance) : 91.62;
+            console.error('Failed to fetch portfolio:', e);
           }
+        }
+
+        if (!Number.isFinite(portfolioValue) || portfolioValue <= 0) {
+          alert('No se pudo obtener el balance del exchange. Abortando operación.');
+          setPendingAction(null);
+          return;
         }
 
         const positionCalc = riskManagement.calculatePositionSize(
@@ -2028,20 +2055,10 @@ const SimulacrumTradingContent = () => {
 
         if (result.success && result.order) {
           orderResult = result.order;
-          // Calculate actual profit from the trade
-          const tradeCost = result.order.filled * (result.order.price || pendingAction.price);
-          // For SELL orders, we gain USDT; for BUY orders, we spend USDT
-          executionProfit = pendingAction.type === 'SELL' ? tradeCost : -tradeCost;
 
-          addMessage('claude_x', 'ALL', 'EXECUTION_CONFIRM', {
-            orderId: result.order.id,
-            status: result.order.status,
-            filledAt: result.order.price,
-            profit: executionProfit.toFixed(2),
-          });
-          console.log('✅ LIVE ORDER EXECUTED:', result.order, 'Profit:', executionProfit);
+          // PnL recognized only at close (same rule as the auto path).
+          executionProfit = 0;
 
-          // ✅ Track position for Risk Management Monitoring (Priority 7)
           if (pendingAction.type === 'BUY') {
             riskManagement.openPosition(
               pendingAction.symbol,
@@ -2050,13 +2067,32 @@ const SimulacrumTradingContent = () => {
               'buy',
               result.order.id
             );
+          } else if (pendingAction.type === 'SELL') {
+            const closed = riskManagement.closePosition(
+              pendingAction.symbol,
+              result.order.price || pendingAction.price
+            );
+            if (closed !== 0) executionProfit = closed;
           }
+
+          addMessage('claude_x', 'ALL', 'EXECUTION_CONFIRM', {
+            orderId: result.order.id,
+            status: result.order.status,
+            filledAt: result.order.price,
+            realizedPnl: executionProfit.toFixed(2),
+          });
+          console.log('✅ LIVE ORDER EXECUTED:', result.order, 'Realized PnL:', executionProfit);
         } else {
           throw new Error(result.error || 'Order execution failed');
         }
       } else {
-        // Paper trading - simulate profit
-        executionProfit = (Math.random() - 0.3) * 100;
+        // Paper trading: PnL realized only on close.
+        executionProfit = 0;
+        if (pendingAction.type === 'BUY') {
+          riskManagement.openPosition(pendingAction.symbol, pendingAction.amount, pendingAction.price, 'buy');
+        } else if (pendingAction.type === 'SELL') {
+          executionProfit = riskManagement.closePosition(pendingAction.symbol, pendingAction.price);
+        }
       }
 
       // Record the trade
@@ -2212,7 +2248,10 @@ const SimulacrumTradingContent = () => {
         <div className="flex items-center gap-4">
           {/* Live Mode Toggle */}
           <button
+            disabled={paperOnlyMode}
+            title={paperOnlyMode ? 'Live mode disabled by VITE_PAPER_TRADING_MODE=true' : ''}
             onClick={async () => {
+              if (paperOnlyMode) return;
               if (!isLiveMode) {
                 // Connect to Binance (PRODUCTION MODE)
                 try {
@@ -2253,10 +2292,12 @@ const SimulacrumTradingContent = () => {
             }}
             className={`px-4 py-1.5 rounded text-xs font-bold transition-all ${isLiveMode
               ? 'bg-red-600 text-white shadow-[0_0_15px_rgba(220,38,38,0.5)]'
-              : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+              : paperOnlyMode
+                ? 'bg-slate-900 text-slate-600 cursor-not-allowed'
+                : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
               }`}
           >
-            {isLiveMode ? '🔴 LIVE MODE' : '🟢 PAPER MODE'}
+            {isLiveMode ? '🔴 LIVE MODE' : paperOnlyMode ? '🔒 PAPER (locked)' : '🟢 PAPER MODE'}
           </button>
 
           {/* AI Provider Status - Multi-Provider System */}

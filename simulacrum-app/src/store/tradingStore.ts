@@ -483,9 +483,11 @@ export const useTradingStore = create<TradingStore>()(
         {
             name: 'simulacrum-trading-store',
             partialize: (state) => ({
-                // Only persist these fields
+                // Only persist strategy config. We intentionally DO NOT
+                // persist isLive: a hot-reload that restores "live=true"
+                // without an actual backend handshake puts the UI in a
+                // misleading state ("LIVE" badge, no exchange connection).
                 activeStrategies: state.activeStrategies,
-                isLive: state.isLive,
             }),
         }
     )

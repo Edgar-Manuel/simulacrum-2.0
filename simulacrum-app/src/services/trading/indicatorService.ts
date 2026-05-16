@@ -383,9 +383,19 @@ class IndicatorService {
             // RSI divergence check would go here
         }
 
-        // MACD crossovers
+        // MACD crossovers — derive the previous histogram value from the same
+        // MACD series we already computed (O(1) instead of recomputing MACD).
         if (indicators.macd) {
-            const prevHistogram = this.calculatePrevMACD(closes);
+            const macdSeries = MACD.calculate({
+                values: closes,
+                fastPeriod: 12,
+                slowPeriod: 26,
+                signalPeriod: 9,
+                SimpleMAOscillator: false,
+                SimpleMASignal: false,
+            });
+            const prev = macdSeries.length >= 2 ? macdSeries[macdSeries.length - 2] : null;
+            const prevHistogram = prev?.histogram ?? null;
             if (prevHistogram !== null) {
                 if (indicators.macd.histogram > 0 && prevHistogram <= 0) {
                     signals.push(this.createSignal(symbol, 'buy', 'strong', 75, currentPrice,
@@ -409,14 +419,22 @@ class IndicatorService {
             }
         }
 
-        // EMA Golden/Death Cross
-        if (indicators.ema50 && indicators.ema200) {
-            const ema50History = EMA.calculate({ values: closes.slice(-3), period: 50 });
-            const ema200History = EMA.calculate({ values: closes.slice(-3), period: 200 });
+        // EMA Golden/Death Cross. EMA needs the full series; passing only the
+        // tail (e.g. slice(-3)) to a period-200 EMA returns an empty array, so
+        // the crossover never triggers. Use the full closes and look at the
+        // last two EMA values.
+        if (indicators.ema50 && indicators.ema200 && closes.length >= 201) {
+            const ema50Series = EMA.calculate({ values: closes, period: 50 });
+            const ema200Series = EMA.calculate({ values: closes, period: 200 });
 
-            if (ema50History.length >= 2 && ema200History.length >= 2) {
-                const prevAbove = ema50History[ema50History.length - 2] > ema200History[ema200History.length - 2];
-                const currAbove = indicators.ema50 > indicators.ema200;
+            if (ema50Series.length >= 2 && ema200Series.length >= 2) {
+                const prev50 = ema50Series[ema50Series.length - 2];
+                const prev200 = ema200Series[ema200Series.length - 2];
+                const last50 = ema50Series[ema50Series.length - 1];
+                const last200 = ema200Series[ema200Series.length - 1];
+
+                const prevAbove = prev50 > prev200;
+                const currAbove = last50 > last200;
 
                 if (!prevAbove && currAbove) {
                     signals.push(this.createSignal(symbol, 'buy', 'very_strong', 85, currentPrice,
@@ -582,23 +600,6 @@ class IndicatorService {
         return signals;
     }
 
-    private calculatePrevMACD(closes: number[]): number | null {
-        if (closes.length < 30) return null;
-
-        const prevCloses = closes.slice(0, -1);
-        const macdResult = MACD.calculate({
-            values: prevCloses,
-            fastPeriod: 12,
-            slowPeriod: 26,
-            signalPeriod: 9,
-            SimpleMAOscillator: false,
-            SimpleMASignal: false,
-        });
-
-        const prev = macdResult[macdResult.length - 1];
-        return prev?.histogram ?? null;
-    }
-
     private createSignal(
         symbol: string,
         type: SignalType,
@@ -609,7 +610,7 @@ class IndicatorService {
         reasoning: string
     ): TradingSignal {
         return {
-            id: `sig_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            id: `sig_${Date.now()}_${typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2, 11)}`,
             symbol,
             type,
             strength,

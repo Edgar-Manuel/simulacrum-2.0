@@ -31,7 +31,12 @@ class ExchangeConfigManager {
 
     constructor() {
         this.initializeConfigs();
-        this.loadFromEnv();
+        // NOTE: exchange API keys/secrets MUST NOT live in the browser bundle.
+        // Vite inlines anything VITE_* prefixed at build time, which would
+        // expose credentials to every visitor. Provide credentials at runtime
+        // from the backend (see backend/.env + backend/src/server.js) and
+        // call setCredentials() with values fetched over an authenticated
+        // channel, never from import.meta.env.
     }
 
     private initializeConfigs(): void {
@@ -100,92 +105,6 @@ class ExchangeConfigManager {
             fees: { maker: 0.08, taker: 0.1 },
             limits: { minOrder: 10, maxOrder: 1000000 },
         });
-    }
-
-    private loadFromEnv(): void {
-        // Binance
-        const binanceKey = import.meta.env.VITE_BINANCE_API_KEY;
-        const binanceSecret = import.meta.env.VITE_BINANCE_SECRET;
-        const binanceSandbox = import.meta.env.VITE_BINANCE_SANDBOX === 'true';
-
-        if (binanceKey && binanceSecret && binanceKey !== 'your_binance_api_key_here') {
-            this.setCredentials('binance', {
-                apiKey: binanceKey,
-                secret: binanceSecret,
-                sandbox: binanceSandbox,
-            });
-        }
-
-        // Coinbase
-        const coinbaseKey = import.meta.env.VITE_COINBASE_API_KEY;
-        const coinbaseSecret = import.meta.env.VITE_COINBASE_SECRET;
-        const coinbaseSandbox = import.meta.env.VITE_COINBASE_SANDBOX === 'true';
-
-        if (coinbaseKey && coinbaseSecret && coinbaseKey !== 'your_coinbase_api_key_here') {
-            this.setCredentials('coinbase', {
-                apiKey: coinbaseKey,
-                secret: coinbaseSecret,
-                sandbox: coinbaseSandbox,
-            });
-        }
-
-        // Kraken
-        const krakenKey = import.meta.env.VITE_KRAKEN_API_KEY;
-        const krakenSecret = import.meta.env.VITE_KRAKEN_SECRET;
-        const krakenSandbox = import.meta.env.VITE_KRAKEN_SANDBOX === 'true';
-
-        if (krakenKey && krakenSecret && krakenKey !== 'your_kraken_api_key_here') {
-            this.setCredentials('kraken', {
-                apiKey: krakenKey,
-                secret: krakenSecret,
-                sandbox: krakenSandbox,
-            });
-        }
-
-        // KuCoin
-        const kucoinKey = import.meta.env.VITE_KUCOIN_API_KEY;
-        const kucoinSecret = import.meta.env.VITE_KUCOIN_SECRET;
-        const kucoinPassword = import.meta.env.VITE_KUCOIN_PASSWORD;
-        const kucoinSandbox = import.meta.env.VITE_KUCOIN_SANDBOX === 'true';
-
-        if (kucoinKey && kucoinSecret && kucoinPassword && kucoinKey !== 'your_kucoin_api_key_here') {
-            this.setCredentials('kucoin', {
-                apiKey: kucoinKey,
-                secret: kucoinSecret,
-                password: kucoinPassword,
-                sandbox: kucoinSandbox,
-            });
-        }
-
-        // Bybit
-        const bybitKey = import.meta.env.VITE_BYBIT_API_KEY;
-        const bybitSecret = import.meta.env.VITE_BYBIT_SECRET;
-        const bybitSandbox = import.meta.env.VITE_BYBIT_SANDBOX === 'true';
-
-        if (bybitKey && bybitSecret && bybitKey !== 'your_bybit_api_key_here') {
-            this.setCredentials('bybit', {
-                apiKey: bybitKey,
-                secret: bybitSecret,
-                sandbox: bybitSandbox,
-            });
-        }
-
-        // OKX
-        const okxKey = import.meta.env.VITE_OKX_API_KEY;
-        const okxSecret = import.meta.env.VITE_OKX_SECRET;
-        const okxPassword = import.meta.env.VITE_OKX_PASSWORD;
-        const okxSandbox = import.meta.env.VITE_OKX_SANDBOX === 'true';
-
-        if (okxKey && okxSecret && okxPassword && okxKey !== 'your_okx_api_key_here') {
-            this.setCredentials('okx', {
-                apiKey: okxKey,
-                secret: okxSecret,
-                password: okxPassword,
-                sandbox: okxSandbox,
-            });
-        }
-
-        console.log(`✅ Loaded credentials for exchanges: ${this.getEnabledExchanges().join(', ') || 'None'}`);
     }
 
     setCredentials(exchangeId: ExchangeId, credentials: ExchangeCredentials): void {

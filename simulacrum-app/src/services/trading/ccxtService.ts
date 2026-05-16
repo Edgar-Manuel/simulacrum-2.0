@@ -483,6 +483,8 @@ class CCXTService {
             canceled: 'cancelled',
             expired: 'cancelled',
             rejected: 'failed',
+            partial: 'partially_filled',
+            partially_filled: 'partially_filled',
         };
         return mapping[status] || 'pending';
     }
