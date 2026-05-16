@@ -7,6 +7,15 @@ import { ethers } from 'ethers';
 import { Token, CurrencyAmount, TradeType, Percent } from '@uniswap/sdk-core';
 import type { SwapQuote, TokenInfo, UniswapPool, Transaction } from '../../types/trading';
 
+// Ethereum addresses must be 0x + 40 hex chars. Fail fast if a constant gets
+// corrupted (we shipped a typo'd DAI address that silently broke swaps).
+function assertAddress(addr: string, label: string): string {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) {
+        throw new Error(`Invalid Ethereum address for ${label}: ${addr}`);
+    }
+    return addr;
+}
+
 // Common token addresses (Ethereum Mainnet)
 const TOKENS: Record<string, TokenInfo> = {
     WETH: {
@@ -28,7 +37,7 @@ const TOKENS: Record<string, TokenInfo> = {
         decimals: 6,
     },
     DAI: {
-        address: '0x6B175474E89094C44Da98b954EesD4C2F4dceB',
+        address: '0x6B175474E89094C44Da98b954EedeAC495271d0F',
         symbol: 'DAI',
         name: 'Dai Stablecoin',
         decimals: 18,
@@ -43,10 +52,15 @@ const TOKENS: Record<string, TokenInfo> = {
 
 // Router addresses
 const ROUTERS = {
-    uniswapV3: '0xE592427A0AEce92De3Edee1F18E0157C05861564',
-    uniswapV2: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',
-    sushiswap: '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F',
+    uniswapV3: assertAddress('0xE592427A0AEce92De3Edee1F18E0157C05861564', 'UniswapV3 Router'),
+    uniswapV2: assertAddress('0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D', 'UniswapV2 Router'),
+    sushiswap: assertAddress('0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F', 'Sushiswap Router'),
 };
+
+// Validate every token address at module load
+for (const [key, token] of Object.entries(TOKENS)) {
+    assertAddress(token.address, key);
+}
 
 // Uniswap V3 Router ABI (simplified)
 const SWAP_ROUTER_ABI = [
@@ -116,7 +130,10 @@ class DeFiService {
         }
 
         try {
-            const quoterAddress = '0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6';
+            const quoterAddress = assertAddress(
+                '0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6',
+                'Uniswap Quoter V2'
+            );
             const quoter = new ethers.Contract(quoterAddress, QUOTER_ABI, this.provider);
 
             const tokenIn = await this.getTokenInfo(tokenInAddress);

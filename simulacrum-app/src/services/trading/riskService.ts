@@ -93,9 +93,14 @@ class RiskManagementService {
         // Position size recommendation
         const positionSizeRecommended = this.calculateRecommendedPositionSize(riskScore, portfolio);
 
-        // Stop loss and take profit based on volatility
+        // Stop loss and take profit based on volatility. Use the last close
+        // from analysis.signals if available (recent and tied to "now"); fall
+        // back to VWAP as a session-average proxy. VWAP alone tends to drift
+        // from current price as the day progresses, so SL/TP recommendations
+        // were biased.
         const atr = analysis.indicators.atr || 0;
-        const currentPrice = analysis.indicators.vwap || 0;
+        const latestSignalPrice = analysis.signals[0]?.price || 0;
+        const currentPrice = latestSignalPrice || analysis.indicators.vwap || 0;
         const atrPercent = currentPrice > 0 ? (atr / currentPrice) * 100 : 2;
 
         const stopLossRecommended = currentPrice * (1 - Math.max(atrPercent * 1.5, this.params.stopLossPercent) / 100);
@@ -432,14 +437,23 @@ class RiskManagementService {
         };
     }
 
+    // Track the first balance seen on a new day so subsequent intra-day
+    // updates don't overwrite startingBalance (which masked real drawdown).
+    private startOfDayBalanceRecorded = false;
+
     updateBalance(newBalance: number): void {
         const today = new Date().toISOString().split('T')[0];
 
-        // Reset if new day
         if (this.dailyStats.date !== today) {
+            // First update of a new day: seed with this balance.
             this.dailyStats = this.initializeDailyStats(newBalance);
+            this.startOfDayBalanceRecorded = true;
             this.isTradeBlocked = false;
             this.blockReason = '';
+        } else if (!this.startOfDayBalanceRecorded) {
+            // First-ever observation. Treat as start-of-day baseline.
+            this.dailyStats.startingBalance = newBalance;
+            this.startOfDayBalanceRecorded = true;
         }
 
         this.dailyStats.currentBalance = newBalance;

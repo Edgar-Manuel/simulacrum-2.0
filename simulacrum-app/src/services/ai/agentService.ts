@@ -238,7 +238,7 @@ class AIAgentsService {
         priority: A2AMessage['priority'] = 'normal'
     ): string {
         const message: A2AMessage = {
-            id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)} `,
+            id: `msg_${Date.now()}_${typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2, 11)}`,
             from: fromId,
             to: toId,
             protocol,
@@ -278,8 +278,10 @@ class AIAgentsService {
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Agent ${agentId} not found`);
 
-        // 🔑 Generar clave de caché basada en agente + prompt (simplificado)
-        const cacheKey = `${agentId}_${prompt.slice(0, 100)} `;
+        // 🔑 Cache key: agentId + djb2-style hash del prompt completo. Antes
+        // se usaba prompt.slice(0,100), lo que colisionaba entre símbolos cuyo
+        // prompt comenzaba igual ("Analyze BTC/EUR...", "Analyze ETH/EUR...").
+        const cacheKey = `${agentId}_${this.hashPrompt(prompt)}`;
 
         // 📦 Verificar caché primero
         const cached = this.callCache.get(cacheKey);
@@ -377,33 +379,64 @@ class AIAgentsService {
         return this.getDefaultResponse(agentId);
     }
 
-    // Respuestas por defecto cuando hay rate limit
-    private getDefaultResponse(agentId: string): string {
-        const defaults: Record<string, string> = {
-            'nexus_prime': '{"decision": "HOLD", "confidence": 50, "reasoning": "Esperando datos actualizados. Mantener posición actual."}',
-            'market_oracle': '{"direction": "neutral", "probability": 50, "action": "HOLD", "reasoning": "Análisis en espera."}',
-            'pulse': '{"interpretation": "neutral", "impact": "low", "confidence": 50}',
-            'guardian': '{"approved": false, "reason": "Validación en espera. Mantener cautela."}',
-            'fingpt_core': '{"decision": "HOLD", "confidence": 50, "reasoning": "Sistema en pausa por rate limit. Mantener posición."}',
-            'claude_x': '{"action": "WAIT", "reason": "Esperando confirmación del sistema."}',
-        };
-        return defaults[agentId] || '{"status": "waiting", "message": "Análisis pendiente"}';
+    private hashPrompt(s: string): string {
+        let h = 5381;
+        for (let i = 0; i < s.length; i++) {
+            h = ((h << 5) + h) ^ s.charCodeAt(i);
+        }
+        // Unsigned 32-bit hex
+        return (h >>> 0).toString(16);
     }
 
-    // 🔧 Helper: Parseo JSON robusto con fallback
+    // Respuestas por defecto cuando hay rate limit / fallo de proveedor.
+    // ⚠️ Mantener la SHAPE alineada con lo que la pipeline consume:
+    //   - market_oracle / nexus_prime / fingpt_core → { action, confidence, ... }
+    //   - guardian → { approved, status, finalRecommendation }
+    //   - pulse → { score, signal, contrarian }
+    //   - claude_x → { valid, reason }
+    // Si la shape cambia aquí, lee analyzeMarket() para no romper el flujo.
+    private getDefaultResponse(agentId: string): string {
+        const defaults: Record<string, string> = {
+            'nexus_prime': '{"bias":"neutral","action":"HOLD","confidence":50,"reasoning":"Esperando datos actualizados. Mantener posición actual."}',
+            'market_oracle': '{"trend":"SIDE","action":"HOLD","probability":50,"reasoning":"Análisis en espera por rate limit."}',
+            'pulse': '{"score":5,"signal":"NEUTRAL","contrarian":false,"reasoning":"Sentimiento sin datos frescos."}',
+            'guardian': '{"approved":false,"status":"REJECTED","finalRecommendation":"HOLD","reason":"Validación en espera. Mantener cautela.","risk":"med"}',
+            'fingpt_core': '{"action":"HOLD","confidence":50,"reasoning":"Sistema en pausa por rate limit. Mantener posición."}',
+            'claude_x': '{"valid":false,"reason":"Esperando confirmación del sistema."}',
+        };
+        return defaults[agentId] || '{"action":"HOLD","confidence":50,"reasoning":"Análisis pendiente"}';
+    }
+
+    // 🔧 Helper: Parseo JSON robusto con fallback.
+    // Una regex greedy /\{[\s\S]*\}/ tragaba todo entre la primera { y la
+    // última }, mezclando objetos múltiples y forzando fallback. En su lugar
+    // buscamos el primer objeto JSON balanceado.
     private safeParseJSON<T>(response: string, fallback: T): T {
-        try {
-            // Extraer JSON de la respuesta (puede venir con texto extra)
-            const jsonMatch = response.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                return JSON.parse(jsonMatch[0]);
+        const start = response.indexOf('{');
+        if (start === -1) return fallback;
+
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        for (let i = start; i < response.length; i++) {
+            const ch = response[i];
+            if (escape) { escape = false; continue; }
+            if (ch === '\\') { escape = true; continue; }
+            if (ch === '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}') {
+                depth--;
+                if (depth === 0) {
+                    try {
+                        return JSON.parse(response.slice(start, i + 1));
+                    } catch {
+                        return fallback;
+                    }
+                }
             }
-            console.warn('⚠️ No JSON found in response, using fallback');
-            return fallback;
-        } catch (error) {
-            console.warn('⚠️ JSON parse failed, using fallback:', error);
-            return fallback;
         }
+        return fallback;
     }
 
     private getMemoryContext(agentId: string): string {
@@ -467,6 +500,8 @@ class AIAgentsService {
         signals: TradingSignal[];
         confidence: number;
         reasoning: string;
+        action: 'BUY' | 'SELL' | 'HOLD';
+        riskApproved: boolean;
     }> {
         // Step 1: Technical Analysis (Market Oracle)
         this.sendMessage('market_oracle', 'ALL', 'MARKET_UPDATE', { symbol, analysis: 'starting' });
@@ -527,6 +562,8 @@ Format as JSON with fields: direction, probability, keyLevels, action, reasoning
                 signals: marketData.signals,
                 confidence: technicalProbability,
                 reasoning: parsedTechnical.reasoning || 'Market Oracle no detectó configuración técnica clara. Esperando mejor oportunidad.',
+                action: 'HOLD',
+                riskApproved: false,
             };
         }
 
@@ -741,11 +778,24 @@ ORDER TO FORMAT:
             decision: parsedDecision
         });
 
+        // Normalize the oracle's decision and the guardian's verdict so the
+        // caller can act on structured values instead of grepping reasoning
+        // text in Spanish.
+        const rawAction = String(parsedDecision.action || parsedDecision.order || 'HOLD').toUpperCase();
+        const oracleAction: 'BUY' | 'SELL' | 'HOLD' =
+            rawAction === 'BUY' || rawAction === 'SELL' ? rawAction : 'HOLD';
+
+        const guardianApproved =
+            parsedRisk.approved === true ||
+            String(parsedRisk.status || '').toUpperCase() === 'APPROVED';
+
         return {
             strategy: strategyResponse,
             signals: marketData.signals,
             confidence: parsedDecision.confidence || parsedDecision.conf || 50,
             reasoning: parsedDecision.reasoning || finalDecision,
+            action: oracleAction,
+            riskApproved: guardianApproved,
         };
     }
 
@@ -763,11 +813,15 @@ ORDER TO FORMAT:
         const memory = this.memory.get(agentId);
         if (!memory) return;
 
+        const MAX_LEN = 500;
+        const truncated = content.length > MAX_LEN
+            ? content.substring(0, MAX_LEN - 14) + ' …[truncated]'
+            : content;
         const entry: MemoryEntry = {
-            id: `mem_${Date.now()} `,
+            id: `mem_${Date.now()}`,
             timestamp: Date.now(),
             type,
-            content: content.substring(0, 500), // Truncate to save memory
+            content: truncated,
             importance,
             context,
         };
@@ -915,49 +969,11 @@ ORDER TO FORMAT:
             }
         }
 
-        // Generar pensamiento contextual si no hay respuesta válida
+        // If we couldn't extract real reasoning from the model output, show a
+        // neutral status rather than fabricating commentary that the user
+        // might mistake for the agent's actual analysis.
         if (!thought || thought.length < 10) {
-            const roleThoughts: Record<string, string[]> = {
-                'STRATEGIST': [
-                    'Analizando liquidez del mercado y flujo de capital institucional...',
-                    'Evaluando condiciones macro: Fed, TGA, repos...',
-                    '¿El sentimiento extremo justifica entrar contra la masa?',
-                    'Revisando correlación BTC-DXY y contexto de liquidez global...'
-                ],
-                'ANALYST': [
-                    'Detectando patrones en estructura de precio...',
-                    'RSI y MACD muestran divergencia, verificando soportes...',
-                    'Buscando ruptura de directriz alcista/bajista...',
-                    'Calculando zonas de volumen y niveles psicológicos...'
-                ],
-                'EXECUTOR': [
-                    'Calculando tamaño de posición óptimo (max 2% riesgo)...',
-                    'Verificando ratio riesgo/beneficio antes de ejecutar...',
-                    'Preparando orden con stop-loss en soporte clave...',
-                    'Evaluando mejor momento de entrada...'
-                ],
-                'RISK_MANAGER': [
-                    'Monitoreando funding rates y apalancamiento del mercado...',
-                    'Evaluando riesgo de liquidación en posiciones actuales...',
-                    'Volatilidad elevada - reduciendo exposición recomendada...',
-                    'Verificando drawdown diario y límites de pérdida...'
-                ],
-                'SENTIMENT': [
-                    'Analizando Fear & Greed Index y sentimiento de redes...',
-                    '¿Hay capitulación? Volumen explosivo + caída = oportunidad...',
-                    'Detectando euforia excesiva en Twitter - posible techo...',
-                    'Cuando todos celebran, es hora de ser cauteloso...'
-                ],
-                'ORACLE': [
-                    'Sintetizando reportes de todos los agentes...',
-                    'Ponderando: liquidez 40%, técnico 30%, sentimiento 20%, riesgo 10%...',
-                    'Decisión final: ¿Están alineados los factores clave?',
-                    'Aplicando sabiduría de Cava + Roger Strategy...'
-                ]
-            };
-
-            const thoughts = roleThoughts[agent.role] || ['Procesando datos...'];
-            thought = thoughts[Math.floor(Math.random() * thoughts.length)];
+            thought = 'Sin razonamiento disponible en la última respuesta del modelo.';
         }
 
         // Truncar si es muy largo (max 150 caracteres para el marquee)

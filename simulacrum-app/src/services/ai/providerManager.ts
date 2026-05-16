@@ -3,7 +3,9 @@
 // OpenRouter (free) + Gemini + Groq
 // ============================================
 
-// Provider configuration
+// ⚠️  DEVELOPMENT-ONLY: these VITE_* keys ship in the browser bundle.
+// For any deployment beyond local prototyping move LLM calls behind the backend
+// and pass a session token to the frontend. See README.
 const OPENROUTER_API_KEY = import.meta.env.VITE_OPENROUTER_API_KEY || '';
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || '';
 const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || '';
@@ -108,7 +110,6 @@ class ProviderManager {
         if (keys.length === 0) return '';
         const key = keys[this.openRouterKeyIndex % keys.length];
         this.openRouterKeyIndex++;
-        console.log(`🔄 OpenRouter using key ${(this.openRouterKeyIndex % keys.length) + 1}/${keys.length}`);
         return key;
     }
 
@@ -117,7 +118,6 @@ class ProviderManager {
         if (keys.length === 0) return '';
         const key = keys[this.groqKeyIndex % keys.length];
         this.groqKeyIndex++;
-        console.log(`🔄 Groq using key ${(this.groqKeyIndex % keys.length) + 1}/${keys.length}`);
         return key;
     }
 
@@ -126,7 +126,6 @@ class ProviderManager {
         if (keys.length === 0) return '';
         const key = keys[this.geminiKeyIndex % keys.length];
         this.geminiKeyIndex++;
-        console.log(`🔄 Gemini using key ${(this.geminiKeyIndex % keys.length) + 1}/${keys.length}`);
         return key;
     }
 

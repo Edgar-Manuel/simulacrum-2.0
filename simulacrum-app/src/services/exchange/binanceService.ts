@@ -4,6 +4,13 @@
 // ============================================
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+const BACKEND_TOKEN = import.meta.env.VITE_BACKEND_TOKEN || '';
+
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    const headers: Record<string, string> = { ...extra };
+    if (BACKEND_TOKEN) headers['x-simulacrum-token'] = BACKEND_TOKEN;
+    return headers;
+}
 
 export interface OrderRequest {
     symbol: string;
@@ -70,7 +77,9 @@ export interface Candle {
 class BinanceService {
     private ws: WebSocket | null = null;
     private isConnected: boolean = false;
-    private mode: 'testnet' | 'live' = 'testnet';
+    // The backend is authoritative on testnet vs live. We default to 'unknown'
+    // until /api/health responds.
+    private mode: 'testnet' | 'live' | 'unknown' = 'unknown';
     private reconnectAttempts: number = 0;
     private maxReconnectAttempts: number = 5;
     private listeners: Map<string, ((data: any) => void)[]> = new Map();
@@ -84,12 +93,16 @@ class BinanceService {
     // CONNECTION
     // ==========================================
 
-    async connect(testnet: boolean = true): Promise<{ success: boolean; message: string; balances?: Record<string, number> }> {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    async connect(_testnet: boolean = false): Promise<{ success: boolean; message: string; balances?: Record<string, number>; mode?: string }> {
         try {
+            // Note: the testnet flag is ignored by the backend; testnet is
+            // controlled by BINANCE_USE_TESTNET in backend/.env. The argument
+            // is kept for API compatibility with the existing UI button.
             const response = await fetch(`${BACKEND_URL}/api/exchange/connect`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ testnet }),
+                headers: authHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({}),
             });
 
             const data = await response.json();
@@ -99,13 +112,12 @@ class BinanceService {
             }
 
             this.isConnected = true;
-            this.mode = testnet ? 'testnet' : 'live';
+            this.mode = data.mode === 'testnet' ? 'testnet' : 'live';
 
-            // Connect WebSocket for real-time data
             this.connectWebSocket();
 
             console.log(`✅ Connected to Binance ${this.mode.toUpperCase()}`);
-            return { success: true, message: data.message, balances: data.balances };
+            return { success: true, message: data.message, balances: data.balances, mode: this.mode };
         } catch (error: any) {
             console.error('Connection error:', error.message);
             return { success: false, message: error.message };
@@ -117,7 +129,8 @@ class BinanceService {
             this.ws.close();
         }
 
-        const wsUrl = BACKEND_URL.replace('http', 'ws') + '/ws';
+        const tokenParam = BACKEND_TOKEN ? `?token=${encodeURIComponent(BACKEND_TOKEN)}` : '';
+        const wsUrl = BACKEND_URL.replace(/^http/, 'ws') + '/ws' + tokenParam;
         this.ws = new WebSocket(wsUrl);
 
         this.ws.onopen = () => {
@@ -132,9 +145,10 @@ class BinanceService {
         this.ws.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
+                if (!data || data.type !== 'ticker' || typeof data.symbol !== 'string') return;
                 const listeners = this.listeners.get(data.symbol) || [];
                 listeners.forEach(callback => callback(data));
-            } catch (e) {
+            } catch {
                 // Silent - don't spam console with parse errors
             }
         };
@@ -145,11 +159,13 @@ class BinanceService {
                 console.log('🔌 WebSocket disconnected - will reconnect...');
                 this.lastWsDisconnectLog = now;
             }
+            if (!this.isConnected) return; // user-initiated disconnect, don't retry
             if (this.reconnectAttempts < this.maxReconnectAttempts) {
                 this.reconnectAttempts++;
-                // Exponential backoff: 5s, 10s, 20s, 40s, 80s
                 const delay = Math.min(5000 * Math.pow(2, this.reconnectAttempts - 1), 60000);
                 setTimeout(() => this.connectWebSocket(), delay);
+            } else {
+                console.warn('🔌 WebSocket max reconnect attempts reached');
             }
         };
 
@@ -164,7 +180,10 @@ class BinanceService {
 
     async getTicker(symbol: string): Promise<Ticker | null> {
         try {
-            const response = await fetch(`${BACKEND_URL}/api/ticker/${symbol.replace('/', '_')}`);
+            const response = await fetch(
+                `${BACKEND_URL}/api/ticker/${symbol.replace('/', '_')}`,
+                { headers: authHeaders() }
+            );
             if (!response.ok) throw new Error('Failed to fetch ticker');
             return await response.json();
         } catch (error: any) {
@@ -176,7 +195,8 @@ class BinanceService {
     async getCandles(symbol: string, timeframe: string = '1h', limit: number = 200): Promise<Candle[]> {
         try {
             const response = await fetch(
-                `${BACKEND_URL}/api/candles/${symbol.replace('/', '_')}?timeframe=${timeframe}&limit=${limit}`
+                `${BACKEND_URL}/api/candles/${symbol.replace('/', '_')}?timeframe=${timeframe}&limit=${limit}`,
+                { headers: authHeaders() }
             );
             if (!response.ok) throw new Error('Failed to fetch candles');
             return await response.json();
@@ -188,7 +208,7 @@ class BinanceService {
 
     async getSymbols(): Promise<string[]> {
         try {
-            const response = await fetch(`${BACKEND_URL}/api/symbols`);
+            const response = await fetch(`${BACKEND_URL}/api/symbols`, { headers: authHeaders() });
             if (!response.ok) throw new Error('Failed to fetch symbols');
             return await response.json();
         } catch (error: any) {
@@ -221,7 +241,7 @@ class BinanceService {
 
     async getPortfolio(): Promise<Portfolio | null> {
         try {
-            const response = await fetch(`${BACKEND_URL}/api/portfolio`);
+            const response = await fetch(`${BACKEND_URL}/api/portfolio`, { headers: authHeaders() });
             if (!response.ok) throw new Error('Failed to fetch portfolio');
             return await response.json();
         } catch (error: any) {
@@ -239,7 +259,7 @@ class BinanceService {
             const url = symbol
                 ? `${BACKEND_URL}/api/orders?symbol=${symbol.replace('/', '_')}`
                 : `${BACKEND_URL}/api/orders`;
-            const response = await fetch(url);
+            const response = await fetch(url, { headers: authHeaders() });
             if (!response.ok) throw new Error('Failed to fetch orders');
             return await response.json();
         } catch (error: any) {
@@ -253,7 +273,9 @@ class BinanceService {
             const params = new URLSearchParams({ limit: String(limit) });
             if (symbol) params.append('symbol', symbol.replace('/', '_'));
 
-            const response = await fetch(`${BACKEND_URL}/api/orders/history?${params}`);
+            const response = await fetch(`${BACKEND_URL}/api/orders/history?${params}`, {
+                headers: authHeaders(),
+            });
             if (!response.ok) throw new Error('Failed to fetch order history');
             return await response.json();
         } catch (error: any) {
@@ -268,7 +290,7 @@ class BinanceService {
 
             const response = await fetch(`${BACKEND_URL}/api/order`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: authHeaders({ 'Content-Type': 'application/json' }),
                 body: JSON.stringify(order),
             });
 
@@ -292,7 +314,7 @@ class BinanceService {
 
             const response = await fetch(
                 `${BACKEND_URL}/api/order/${orderId}?symbol=${symbol.replace('/', '_')}`,
-                { method: 'DELETE' }
+                { method: 'DELETE', headers: authHeaders() }
             );
 
             const data = await response.json();
@@ -315,6 +337,8 @@ class BinanceService {
 
     async healthCheck(): Promise<{ status: string; mode: string; exchange: string }> {
         try {
+            // /api/health is intentionally unauthenticated so the UI can detect
+            // backend availability without a configured token.
             const response = await fetch(`${BACKEND_URL}/api/health`);
             return await response.json();
         } catch (error) {
@@ -322,7 +346,7 @@ class BinanceService {
         }
     }
 
-    getMode(): 'testnet' | 'live' {
+    getMode(): 'testnet' | 'live' | 'unknown' {
         return this.mode;
     }
 
