@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "backtest": "tsx scripts/runBacktest.ts"
+    "backtest": "tsx scripts/runBacktest.ts",
+    "research": "tsx scripts/runResearch.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.11",

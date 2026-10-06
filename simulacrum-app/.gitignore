@@ -42,3 +42,6 @@ buy_*.cjs
 buy_*.js
 *_order.json
 TRADING_REPORT_*.md
+
+.cache/
+research_*.json
